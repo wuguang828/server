@@ -5,7 +5,7 @@
 # 
 #         USAGE: ./hy2-install.sh
 #
-#   DESCRIPTION: Hysteria 2 一键安装、配置、维护脚本
+#   DESCRIPTION: Hysteria 2 一键安装、配置、维护脚本（带配置导出）
 #
 #   OPTIONS: 
 #       install   - 安装 Hysteria 2
@@ -18,11 +18,12 @@
 #       update    - 更新到最新版本
 #       firewall  - 配置防火墙
 #       log       - 查看日志
+#       export    - 导出配置（多种格式）
 #
 #       AUTHOR: wuguang828
-#      VERSION: 2.0
+#      VERSION: 3.0
 #      CREATED: 2026-04-08
-#     REVISION: 1.0
+#     REVISION: 2.0
 #===============================================================================
 
 set -e
@@ -32,6 +33,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # 全局变量
@@ -41,6 +43,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 HYSTERIA_BIN="/usr/bin/hysteria"
 CERT_DIR="/etc/hysteria"
 LOG_FILE="/var/log/hysteria.log"
+CONFIG_BACKUP_DIR="/root/hy2-config-backup"
 
 # 打印信息
 print_info() {
@@ -84,7 +87,6 @@ detect_os() {
     
     print_info "检测到系统：${OS} ${VER}"
     
-    # 检测包管理器
     if command -v apt-get &> /dev/null; then
         PM="apt"
     elif command -v yum &> /dev/null; then
@@ -103,17 +105,17 @@ detect_os() {
 check_dependencies() {
     print_info "检查依赖..."
     
-    local deps=("curl" "wget" "openssl")
+    local deps=("curl" "wget" "openssl" "qrencode")
     
     for dep in "${deps[@]}"; do
         if ! command -v $dep &> /dev/null; then
             print_warning "$dep 未安装，正在安装..."
             if [ "$PM" = "apt" ]; then
-                apt-get update && apt-get install -y $dep
+                apt-get update && apt-get install -y $dep 2>/dev/null
             elif [ "$PM" = "yum" ]; then
-                yum install -y $dep
+                yum install -y $dep 2>/dev/null
             elif [ "$PM" = "dnf" ]; then
-                dnf install -y $dep
+                dnf install -y $dep 2>/dev/null
             fi
         fi
     done
@@ -134,17 +136,18 @@ get_server_ip() {
 generate_config() {
     PORT=${HY2_PORT:-$((RANDOM % 55535 + 10000))}
     PASS=${HY2_PASSWORD:-$(openssl rand -hex 16)}
+    HOSTNAME=${HY2_HOSTNAME:-"Hysteria2-$(hostname)"}
     
     print_info "生成配置..."
     print_info "端口：$PORT"
     print_info "密码：$PASS"
+    print_info "主机名：$HOSTNAME"
 }
 
 # 下载 Hysteria 2
 download_hysteria() {
     print_info "下载 Hysteria 2..."
     
-    # 获取最新版本
     LATEST_VERSION=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' | cut -c2-)
     
     if [ -z "$LATEST_VERSION" ]; then
@@ -154,7 +157,6 @@ download_hysteria() {
     
     print_info "最新版本：v${LATEST_VERSION}"
     
-    # 检测架构
     ARCH=$(uname -m)
     case $ARCH in
         x86_64) ARCH="amd64" ;;
@@ -165,7 +167,6 @@ download_hysteria() {
     
     print_info "系统架构：$ARCH"
     
-    # 下载
     local DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/v${LATEST_VERSION}/hysteria-linux-${ARCH}"
     
     wget -q --show-progress -O ${HYSTERIA_BIN} ${DOWNLOAD_URL}
@@ -211,6 +212,7 @@ create_config() {
     cat > ${CONFIG_FILE} << EOF
 # Hysteria 2 配置文件
 # 生成时间：$(date)
+# 主机名：${HOSTNAME}
 
 listen: :${PORT}
 
@@ -239,7 +241,6 @@ quic:
 speedTest: true
 disableUDP: false
 
-# 日志配置
 log:
   level: info
   output: ${LOG_FILE}
@@ -282,9 +283,7 @@ EOF
 configure_firewall() {
     print_info "配置防火墙..."
     
-    # 检测防火墙
     if command -v firewall-cmd &> /dev/null; then
-        # CentOS/RHEL - firewalld
         if systemctl is-active --quiet firewalld; then
             firewall-cmd --permanent --add-port=${PORT}/udp
             firewall-cmd --permanent --add-port=${PORT}/tcp
@@ -294,7 +293,6 @@ configure_firewall() {
             print_warning "firewalld 未运行，跳过配置"
         fi
     elif command -v ufw &> /dev/null; then
-        # Ubuntu/Debian - ufw
         if systemctl is-active --quiet ufw; then
             ufw allow ${PORT}/udp
             ufw allow ${PORT}/tcp
@@ -303,11 +301,9 @@ configure_firewall() {
             print_warning "ufw 未运行，跳过配置"
         fi
     elif command -v iptables &> /dev/null; then
-        # 直接使用 iptables
         iptables -I INPUT -p udp --dport ${PORT} -j ACCEPT
         iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT
         
-        # 保存规则
         if [ -f /etc/redhat-release ]; then
             service iptables save 2>/dev/null || iptables-save > /etc/sysconfig/iptables
         elif [ -f /etc/debian_version ]; then
@@ -336,40 +332,203 @@ start_service() {
     fi
 }
 
-# 显示配置信息
-show_config() {
+# 导出配置（多种格式）
+export_config() {
     local SERVER_IP=$(get_server_ip)
+    mkdir -p ${CONFIG_BACKUP_DIR}
     
     echo -e ""
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}  Hysteria 2 安装配置完成！${NC}"
+    echo -e "${GREEN}  📋 Hysteria 2 配置信息${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo -e ""
-    echo -e "${BLUE}服务器信息：${NC}"
-    echo -e "  服务器地址：${SERVER_IP}"
-    echo -e "  端口：${PORT}"
-    echo -e "  密码：${PASS}"
-    echo -e "  协议：Hysteria 2 (QUIC)"
+    
+    # ========== 1. 基本信息 ==========
+    echo -e "${CYAN}【1】基本信息${NC}"
+    echo -e "  服务器地址：${YELLOW}${SERVER_IP}${NC}"
+    echo -e "  端口：${YELLOW}${PORT}${NC}"
+    echo -e "  密码：${YELLOW}${PASS}${NC}"
+    echo -e "  协议：${YELLOW}Hysteria 2 (QUIC)${NC}"
+    echo -e "  主机名：${YELLOW}${HOSTNAME}${NC}"
     echo -e ""
-    echo -e "${BLUE}连接命令：${NC}"
-    echo -e "${YELLOW}hysteria2://${PASS}@${SERVER_IP}:${PORT}/?insecure=1&alpn=h3&obfs=none#Hysteria2${NC}"
+    
+    # ========== 2. Hysteria2 链接格式 ==========
+    echo -e "${CYAN}【2】Hysteria2 链接格式（一键导入）${NC}"
+    local HY2_LINK="hysteria2://${PASS}@${SERVER_IP}:${PORT}/?insecure=1&alpn=h3&obfs=none#${HOSTNAME}"
+    echo -e "${YELLOW}${HY2_LINK}${NC}"
     echo -e ""
-    echo -e "${BLUE}配置文件：${NC}"
-    echo -e "  ${CONFIG_FILE}"
+    
+    # ========== 3. JSON 格式（NekoBox/Hiddify） ==========
+    echo -e "${CYAN}【3】JSON 格式（客户端导入）${NC}"
+    cat << EOFJ
+{
+  "server": "${SERVER_IP}:${PORT}",
+  "auth": "${PASS}",
+  "tls": {
+    "insecure": true,
+    "serverName": "${SERVER_IP}"
+  },
+  "quic": {
+    "initStreamReceiveWindow": 8388608,
+    "maxStreamReceiveWindow": 8388608,
+    "initConnReceiveWindow": 20971520,
+    "maxConnReceiveWindow": 20971520
+  },
+  "transport": {
+    "type": "udp"
+  },
+  "remark": "${HOSTNAME}"
+}
+EOFJ
     echo -e ""
-    echo -e "${BLUE}服务管理：${NC}"
-    echo -e "  启动：systemctl start ${SERVICE_NAME}"
-    echo -e "  停止：systemctl stop ${SERVICE_NAME}"
-    echo -e "  重启：systemctl restart ${SERVICE_NAME}"
-    echo -e "  状态：systemctl status ${SERVICE_NAME}"
-    echo -e "  日志：journalctl -u ${SERVICE_NAME} -f"
+    
+    # ========== 4. Clash Meta 格式 ==========
+    echo -e "${CYAN}【4】Clash Meta 格式${NC}"
+    cat << EOFC
+  - name: "${HOSTNAME}"
+    type: hysteria2
+    server: ${SERVER_IP}
+    port: ${PORT}
+    password: ${PASS}
+    alpn:
+      - h3
+    sni: ${SERVER_IP}
+    skip-cert-verify: true
+    up: "100 Mbps"
+    down: "100 Mbps"
+EOFC
     echo -e ""
-    echo -e "${BLUE}客户端下载：${NC}"
+    
+    # ========== 5. Sing-Box 格式 ==========
+    echo -e "${CYAN}【5】Sing-Box 格式${NC}"
+    cat << EOFS
+{
+  "tag": "${HOSTNAME}",
+  "type": "hysteria2",
+  "server": "${SERVER_IP}",
+  "server_port": ${PORT},
+  "password": "${PASS}",
+  "tls": {
+    "enabled": true,
+    "insecure": true,
+    "server_name": "${SERVER_IP}"
+  }
+}
+EOFS
+    echo -e ""
+    
+    # ========== 6. 纯文本格式（方便复制） ==========
+    echo -e "${CYAN}【6】纯文本格式${NC}"
+    cat << EOFT
+服务器地址：${SERVER_IP}
+端口：${PORT}
+密码：${PASS}
+协议：Hysteria 2
+TLS：启用
+跳过证书验证：启用
+ALPN：h3
+EOFT
+    echo -e ""
+    
+    # ========== 7. 生成二维码（如果安装了 qrencode） ==========
+    if command -v qrencode &> /dev/null; then
+        echo -e "${CYAN}【7】二维码（手机扫描导入）${NC}"
+        echo -e "  生成二维码..."
+        qrencode -t ANSIUTF8 "${HY2_LINK}"
+        echo -e ""
+    fi
+    
+    # ========== 8. 保存配置文件 ==========
+    echo -e "${CYAN}【8】配置备份${NC}"
+    local BACKUP_FILE="${CONFIG_BACKUP_DIR}/hy2-config-$(date +%Y%m%d-%H%M%S).txt"
+    
+    cat > ${BACKUP_FILE} << EOFB
+# Hysteria 2 配置备份
+# 生成时间：$(date)
+# 服务器：${SERVER_IP}
+
+【Hysteria2 链接】
+${HY2_LINK}
+
+【基本信息】
+服务器地址：${SERVER_IP}
+端口：${PORT}
+密码：${PASS}
+协议：Hysteria 2 (QUIC)
+主机名：${HOSTNAME}
+
+【JSON 格式】
+{
+  "server": "${SERVER_IP}:${PORT}",
+  "auth": "${PASS}",
+  "tls": {
+    "insecure": true,
+    "serverName": "${SERVER_IP}"
+  },
+  "quic": {
+    "initStreamReceiveWindow": 8388608,
+    "maxStreamReceiveWindow": 8388608,
+    "initConnReceiveWindow": 20971520,
+    "maxConnReceiveWindow": 20971520
+  },
+  "remark": "${HOSTNAME}"
+}
+
+【Clash Meta 格式】
+  - name: "${HOSTNAME}"
+    type: hysteria2
+    server: ${SERVER_IP}
+    port: ${PORT}
+    password: ${PASS}
+    alpn:
+      - h3
+    sni: ${SERVER_IP}
+    skip-cert-verify: true
+
+【Sing-Box 格式】
+{
+  "tag": "${HOSTNAME}",
+  "type": "hysteria2",
+  "server": "${SERVER_IP}",
+  "server_port": ${PORT},
+  "password": "${PASS}",
+  "tls": {
+    "enabled": true,
+    "insecure": true,
+    "server_name": "${SERVER_IP}"
+  }
+}
+EOFB
+
+    print_success "配置已保存到：${BACKUP_FILE}"
+    echo -e ""
+    
+    # ========== 9. 客户端下载链接 ==========
+    echo -e "${CYAN}【9】客户端下载${NC}"
     echo -e "  Android: https://github.com/MatsuriDayo/NekoBoxForAndroid/releases"
     echo -e "  Windows: https://github.com/hiddify/hiddify-next/releases"
-    echo -e "  iOS:     使用 Shadowrocket 或 Streisand"
+    echo -e "  iOS:     Shadowrocket / Streisand"
+    echo -e "  macOS:   Hiddify / ClashX"
     echo -e ""
+    
+    # ========== 10. 快速复制区 ==========
     echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}  📌 快速复制区${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo -e ""
+    echo -e "一键导入链接："
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${WHITE}${HY2_LINK}${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e ""
+    
+    print_success "所有配置已导出！"
+    echo -e ""
+}
+
+# 显示配置信息（简化版）
+show_config() {
+    export_config
 }
 
 # 安装主函数
@@ -387,7 +546,7 @@ do_install() {
     create_service
     configure_firewall
     start_service
-    show_config
+    export_config
     
     print_success "安装完成！"
 }
@@ -426,14 +585,18 @@ do_log() {
 # 显示配置
 do_config() {
     if [ -f ${CONFIG_FILE} ]; then
-        echo -e "${BLUE}配置文件：${CONFIG_FILE}${NC}"
-        echo -e ""
-        cat ${CONFIG_FILE}
-        echo -e ""
-        show_config
+        local SERVER_IP=$(get_server_ip)
+        local PORT=$(grep "listen:" ${CONFIG_FILE} | awk '{print $2}' | tr -d ':')
+        local PASS=$(grep "password:" ${CONFIG_FILE} | awk '{print $2}')
+        export_config
     else
         print_error "配置文件不存在"
     fi
+}
+
+# 导出配置到文件
+do_export() {
+    do_config
 }
 
 # 更新 Hysteria
@@ -446,6 +609,16 @@ do_update() {
     do_install
     
     print_success "更新完成"
+}
+
+# 配置防火墙
+do_firewall() {
+    if [ -f ${CONFIG_FILE} ]; then
+        PORT=$(grep "listen:" ${CONFIG_FILE} | awk '{print $2}' | tr -d ':')
+        configure_firewall
+    else
+        print_error "配置文件不存在"
+    fi
 }
 
 # 卸载服务
@@ -474,19 +647,9 @@ do_uninstall() {
     print_success "卸载完成"
 }
 
-# 配置防火墙
-do_firewall() {
-    if [ -f ${CONFIG_FILE} ]; then
-        PORT=$(grep "listen:" ${CONFIG_FILE} | awk '{print $2}' | tr -d ':')
-        configure_firewall
-    else
-        print_error "配置文件不存在"
-    fi
-}
-
 # 显示帮助
 show_help() {
-    echo -e "${GREEN}Hysteria 2 一键安装维护脚本${NC}"
+    echo -e "${GREEN}Hysteria 2 一键安装维护脚本 v3.0${NC}"
     echo -e ""
     echo -e "用法：$0 [命令]"
     echo -e ""
@@ -496,7 +659,8 @@ show_help() {
     echo -e "  stop      停止服务"
     echo -e "  restart   重启服务"
     echo -e "  status    查看服务状态"
-    echo -e "  config    显示配置信息"
+    echo -e "  config    显示/导出配置（多种格式）"
+    echo -e "  export    导出配置到文件"
     echo -e "  update    更新到最新版本"
     echo -e "  firewall  重新配置防火墙"
     echo -e "  log       查看服务日志"
@@ -504,11 +668,18 @@ show_help() {
     echo -e "  help      显示此帮助信息"
     echo -e ""
     echo -e "示例:"
-    echo -e "  $0              # 安装"
+    echo -e "  $0              # 安装并导出配置"
     echo -e "  $0 install      # 安装"
+    echo -e "  $0 config       # 显示所有格式配置"
+    echo -e "  $0 export       # 导出配置到文件"
     echo -e "  $0 restart      # 重启"
     echo -e "  $0 status       # 查看状态"
-    echo -e "  $0 config       # 显示配置"
+    echo -e ""
+    echo -e "自定义配置:"
+    echo -e "  export HY2_PORT=8443"
+    echo -e "  export HY2_PASSWORD=your_password"
+    echo -e "  export HY2_HOSTNAME=My-Server"
+    echo -e "  $0 install"
 }
 
 # 主程序
@@ -531,7 +702,7 @@ main() {
         status)
             do_status
             ;;
-        config)
+        config|export)
             do_config
             ;;
         update)
