@@ -1,101 +1,70 @@
 #!/bin/bash
-# Hysteria 2 简化安装脚本
+# 修复并重新安装
 
-set -e
+echo "🔧 正在修复 Hysteria 2..."
 
-echo "🚀 开始安装 Hysteria 2..."
+# 1. 安装缺失的工具
+echo "安装 net-tools..."
+apt-get update
+apt-get install -y net-tools
 
-# 检查root
-if [[ $EUID -ne 0 ]]; then
-   echo "错误：必须使用root权限运行！"
-   exit 1
+# 2. 停止当前服务
+systemctl stop hysteria-server 2>/dev/null || true
+
+# 3. 检查配置
+echo "检查配置文件..."
+cat /etc/hysteria/config.yaml
+
+# 4. 检查二进制文件
+echo "检查 Hysteria 二进制文件..."
+ls -la /usr/bin/hysteria
+/usr/bin/hysteria --version || {
+    echo "Hysteria 未正确安装，重新下载..."
+    wget -O /usr/bin/hysteria https://github.com/apernet/hysteria/releases/download/v2.4.2/hysteria-linux-amd64
+    chmod +x /usr/bin/hysteria
+}
+
+# 5. 生成证书（如果不存在）
+if [ ! -f /etc/hysteria/server.crt ]; then
+    echo "生成 TLS 证书..."
+    mkdir -p /etc/hysteria
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout /etc/hysteria/server.key \
+        -out /etc/hysteria/server.crt \
+        -days 3650 -subj "/CN=$(curl -s -4 icanhazip.com)" 2>/dev/null
 fi
 
-# 安装依赖
-echo "安装依赖..."
-apt-get update
-apt-get install -y curl wget openssl
+# 6. 手动测试启动
+echo "测试启动..."
+timeout 5 /usr/bin/hysteria server -c /etc/hysteria/config.yaml || true
 
-# 获取最新版本的 Hysteria 2
-echo "下载 Hysteria 2..."
-LATEST_VERSION=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' | cut -c2-)
-wget -O /usr/bin/hysteria https://github.com/apernet/hysteria/releases/download/v${LATEST_VERSION}/hysteria-linux-amd64
-chmod +x /usr/bin/hysteria
-
-# 生成配置
-PORT=$((RANDOM % 55535 + 10000))
-PASS=$(openssl rand -hex 16)
-SERVER_IP=$(curl -s -4 icanhazip.com)
-
-# 创建目录和证书
-mkdir -p /etc/hysteria
-openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout /etc/hysteria/server.key \
-    -out /etc/hysteria/server.crt \
-    -days 3650 -subj "/CN=${SERVER_IP}" 2>/dev/null
-
-# 创建配置文件
-cat > /etc/hysteria/config.yaml << EOF
-listen: :${PORT}
-
-tls:
-  cert: /etc/hysteria/server.crt
-  key: /etc/hysteria/server.key
-
-auth:
-  type: password
-  password: ${PASS}
-
-masquerade:
-  type: proxy
-  proxy:
-    url: https://www.bing.com
-    rewriteHost: true
-
-speedTest: true
-disableUDP: false
-EOF
-
-# 创建systemd服务
-cat > /etc/systemd/system/hysteria-server.service << EOF
-[Unit]
-Description=Hysteria 2 Server
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/hysteria server -c /etc/hysteria/config.yaml
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# 启动服务
+# 7. 启动服务
+echo "启动服务..."
 systemctl daemon-reload
 systemctl enable hysteria-server.service
 systemctl start hysteria-server.service
+sleep 3
 
-# 开放防火墙
-ufw allow ${PORT}/udp 2>/dev/null || true
-ufw allow ${PORT}/tcp 2>/dev/null || true
-
-# 显示配置
-echo ""
-echo "========================================"
-echo "  ✅ Hysteria 2 安装完成！"
-echo "========================================"
-echo ""
-echo "服务器地址：${SERVER_IP}"
-echo "端口：${PORT}"
-echo "密码：${PASS}"
-echo ""
-echo "连接命令："
-echo "hysteria2://${PASS}@${SERVER_IP}:${PORT}/?insecure=1&alpn=h3&obfs=none#Hysteria2"
+# 8. 检查状态
 echo ""
 echo "服务状态："
 systemctl status hysteria-server --no-pager
+
+# 9. 开放防火墙
+ufw allow 24330/udp 2>/dev/null || true
+ufw allow 24330/tcp 2>/dev/null || true
+
+# 10. 显示配置
+SERVER_IP=$(curl -s -4 icanhazip.com)
+echo ""
+echo "========================================"
+echo "  ✅ 修复完成！"
+echo "========================================"
+echo ""
+echo "服务器地址：${SERVER_IP}"
+echo "端口：24330"
+echo "密码：66315b5a411efde221cd0ce317875ffa"
+echo ""
+echo "连接命令："
+echo "hysteria2://66315b5a411efde221cd0ce317875ffa@${SERVER_IP}:24330/?insecure=1&alpn=h3&obfs=none#Hysteria2"
 echo ""
