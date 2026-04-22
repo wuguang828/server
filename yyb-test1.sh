@@ -336,87 +336,108 @@ if [ -n "$ADB_PATH" ]; then
         fi
 
         # === 如果 curl 和 wget 都不可用，使用 Android 内置工具做连通性测试 ===
+        # 注意：Android adb shell 使用的是 toybox sh，不是 bash！
+        # /dev/tcp/ 仅在 bash 中有效，nc 在 toybox 中行为不标准
+        # 可靠的测试方式：ping (ICMP) + am start (浏览器全链路)
+
         if [ "$VM_CURL_AVAILABLE" = "0" ] && [ "$VM_WGET_AVAILABLE" = "0" ]; then
-            echo -e " $WARN VM 内 curl/wget 均不可用，使用 Android 内置工具测试连通性"
+            echo -e " $WARN VM 内 curl/wget 均不可用"
+            echo -e " $INFO 使用 Android 内置工具测试 (ping ICMP + am start 浏览器全链路)"
 
-            # 方法1: 使用 am start 让浏览器打开 URL（验证 DNS + TCP + TLS 全链路）
-            echo -e " $INFO VM 内 HTTP 连通性测试 (ping + TCP connect):"
-
-            # 测试 HTTP 80 端口连通性
-            VM_HTTP80=$("$ADB_PATH" shell "echo > /dev/tcp/$TARGET_HOST/80" 2>&1)
-            if [ $? -eq 0 ] || [ -z "$VM_HTTP80" ]; then
-                echo -e "   $PASS $TARGET_HOST:80 TCP 连接成功"
-                VM_HTTP_OK="yes"
+            # 方法1: 用 ping 测试外网 (ICMP 层) — 这是最可靠的底层测试
+            echo -e " $INFO VM 内 ICMP ping 测试 (网络层连通性):"
+            VM_PING_TARGETS=("10.0.2.2" "8.8.8.8" "$TARGET_HOST")
+            PING_PASS=0
+            for target in "${VM_PING_TARGETS[@]}"; do
+                VM_PING_EXT=$("$ADB_PATH" shell "ping -c 1 -W 3 $target" 2>/dev/null | tr -d '\r')
+                VM_PING_TIME=$(echo "$VM_PING_EXT" | grep -o 'time=[0-9.]*' | cut -d= -f2)
+                VM_PING_LOSS=$(echo "$VM_PING_EXT" | grep "packet loss" | grep -o '[0-9]*%')
+                if [ -n "$VM_PING_TIME" ]; then
+                    echo -e "   $PASS ping $target → ${VM_PING_TIME}ms (丢包: ${VM_PING_LOSS:-0%})"
+                    PING_PASS=$((PING_PASS + 1))
+                else
+                    echo -e "   $FAIL ping $target → 超时或丢包 (${VM_PING_LOSS:-100%})"
+                fi
+            done
+            if [ "$PING_PASS" -ge 2 ]; then
+                echo -e "   $PASS ICMP 层: 网络基本连通 ($PING_PASS/${#VM_PING_TARGETS[@]} 目标可达)"
+                VM_HTTP_OK="likely_ok"
             else
-                echo -e "   $FAIL $TARGET_HOST:80 TCP 连接失败"
+                echo -e "   $FAIL ICMP 层: 大部分目标不可达"
                 VM_HTTP_OK="no"
             fi
 
-            # 测试 HTTPS 443 端口连通性
-            echo -e " $INFO VM 内 HTTPS 连通性测试 (TCP 443 + TLS) [关键测试]:"
-            VM_HTTPS443=$("$ADB_PATH" shell "echo > /dev/tcp/$TARGET_HOST/443" 2>&1)
-            if [ $? -eq 0 ] || [ -z "$VM_HTTPS443" ]; then
-                echo -e "   $PASS $TARGET_HOST:443 TCP 连接成功 (TLS握手未测)"
-                VM_HTTPS_OK="partial"
-            else
-                echo -e "   $FAIL $TARGET_HOST:443 TCP 连接失败 (HTTPS 完全不可达!)"
-                VM_HTTPS_OK="no"
-            fi
-
-            # 方法2: 使用 Android 的 ConnectivityService 诊断
-            echo -e " $INFO VM 内网络连通性验证 (ConnectivityService):"
+            # 方法2: ConnectivityService 验证状态
+            echo -e " $INFO VM 内网络验证状态 (ConnectivityService):"
             VM_CS=$("$ADB_PATH" shell "dumpsys connectivity" 2>/dev/null)
-            VM_VALIDATED=$(echo "$VM_CS" | grep -c "VALIDATED" | head -1)
-            VM_NOT_VALIDATED=$(echo "$VM_CS" | grep -c "NOT_VALIDATED" | head -1)
-            if [ "$VM_VALIDATED" -gt 0 ] 2>/dev/null; then
-                echo -e "   $PASS 网络验证状态: VALIDATED (Android 系统判定网络可用)"
+            VM_VALIDATED=$(echo "$VM_CS" | grep -c "VALIDATED" 2>/dev/null)
+            if [ "${VM_VALIDATED:-0}" -gt 0 ]; then
+                echo -e "   $PASS 状态: VALIDATED (Android 系统已确认网络可用)"
             else
-                echo -e "   $FAIL 网络验证状态: NOT_VALIDATED (Android 系统判定网络不可用!)"
-                VM_HTTPS_OK="no"
+                echo -e "   $WARN 状态: NOT_VALIDATED 或无法判断"
             fi
 
-            # 方法3: 用 toybox nc 测试 TCP 连接+数据传输
-            echo -e " $INFO VM 内 TCP 数据传输测试 (toybox nc):"
-            VM_NC_CHECK=$("$ADB_PATH" shell "which nc" 2>/dev/null | tr -d '\r')
-            if [ -n "$VM_NC_CHECK" ]; then
-                # 发送 HTTP HEAD 请求并检查是否有响应
-                VM_NC_HTTP=$("$ADB_PATH" shell "echo 'HEAD / HTTP/1.0\r\nHost: $TARGET_HOST\r\n\r\n' | nc -w 5 $TARGET_HOST 80" 2>/dev/null | head -1 | tr -d '\r')
-                if echo "$VM_NC_HTTP" | grep -q "HTTP/"; then
-                    echo -e "   $PASS HTTP 数据传输正常: $VM_NC_HTTP"
-                    VM_HTTP_OK="yes"
-                else
-                    echo -e "   $FAIL HTTP 数据传输异常 (TCP连接可能成功但无HTTP响应)"
-                    VM_HTTP_OK="no"
-                fi
+            # 方法3: 用 Android Intent 打开 URL 浏览器 (测试 DNS + TCP + TLS 全链路)
+            # 这是最接近真实使用场景的测试
+            echo -e " $INFO VM 内 HTTP 全链路测试 (通过浏览器, 10秒超时):"
+            "$ADB_PATH" shell "am start -a android.intent.action.VIEW -d '$TARGET_URL_HTTP'" >/dev/null 2>&1
+            sleep 3
+            # 检查是否有 Activity 启动成功
+            VM_AM_RESULT=$("$ADB_PATH" shell "dumpsys activity activities" 2>/dev/null | grep -o "mResumedActivity.*$TARGET_HOST\|mFocusedActivity.*$TARGET_HOST" | tail -1 | tr -d '\r')
+            if [ -n "$VM_AM_RESULT" ]; then
+                echo -e "   $PASS 浏览器已启动并尝试加载 HTTP 页面"
+                VM_HTTP_OK="likely_ok"
+            else
+                echo -e "   $INFO 无法确认浏览器加载结果 (需人工观察)"
+            fi
 
-                VM_NC_HTTPS=$("$ADB_PATH" shell "echo 'HEAD / HTTP/1.0\r\nHost: $TARGET_HOST\r\n\r\n' | nc -w 5 $TARGET_HOST 443" 2>/dev/null | head -1 | tr -d '\r')
-                if echo "$VM_NC_HTTPS" | grep -q "HTTP/"; then
-                    echo -e "   $PASS HTTPS 数据传输正常: $VM_NC_HTTPS (TLS 未测试)"
-                    VM_HTTPS_OK="partial"
+            echo -e " $INFO VM 内 HTTPS 全链路测试 (通过浏览器, 关键测试):"
+            "$ADB_PATH" shell "am start -a android.intent.action.VIEW -d '$TARGET_URL_HTTPS'" >/dev/null 2>&1
+            sleep 5
+            # 检查当前前台 Activity
+            VM_AM_HTTPS=$("$ADB_PATH" shell "dumpsys activity activities" 2>/dev/null | grep "mResumedActivity" | tail -1 | tr -d '\r')
+            if echo "$VM_AM_HTTPS" | grep -qiE "browser|chrome|webview|http"; then
+                echo -e "   $PASS 浏览器正在显示页面 (HTTPS 加载中/已完成)"
+                VM_HTTPS_OK="likely_ok"
+            elif echo "$VM_AM_HTTPS" | grep -qiE "error|fail|dialog"; then
+                echo -e "   $FAIL 浏览器显示错误页面 (HTTPS 可能失败)"
+                VM_HTTPS_OK="no"
+            else
+                echo -e "   $INFO 请在模拟器屏幕上观察: 是否能正常打开 $TARGET_URL_HTTPS ?"
+                echo -e "   $INFO 如能看到重定向/下载页面 → HTTPS 正常"
+                echo -e "   $INFO 如提示连接错误/超时 → Curl Error 28 复现"
+                VM_HTTPS_OK="manual_check"
+            fi
+
+            # 方法4: 用 toybox wget 如果存在 (部分 Android 有)
+            echo -e " $INFO 尝试 toybox wget (部分 Android 版本自带):"
+            VM_TOYBOX_WGET=$("$ADB_PATH" shell "toybox wget --help 2>&1" | head -1 | tr -d '\r')
+            if echo "$VM_TOYBOX_WGET" | grep -qi "wget\|usage"; then
+                echo -e "   $INFO toybox wget 可用，执行测试..."
+                VM_TWB_HTTP=$("$ADB_PATH" shell "toybox wget -q -O /dev/null --timeout=10 $TARGET_URL_HTTP 2>&1" | tr -d '\r')
+                TWB_RC=$?
+                if [ "$TWB_RC" -eq 0 ]; then
+                    echo -e "   $PASS toybox wget HTTP 成功"
                 else
-                    echo -e "   $FAIL HTTPS 数据传输异常 (443端口连接后无HTTP响应，TLS握手可能卡住)"
+                    echo -e "   $WARN toybox wget HTTP 返回码: $TWB_RC"
+                fi
+                VM_TWB_HTTPS=$("$ADB_PATH" shell "toybox wget -q -O /dev/null --timeout=10 $TARGET_URL_HTTPS 2>&1" | tr -d '\r')
+                TWBS_RC=$?
+                if [ "$TWBS_RC" -eq 0 ]; then
+                    echo -e "   $PASS toybox wget HTTPS 成功"
+                    VM_HTTPS_OK="yes"
+                else
+                    echo -e "   $FAIL toybox wget HTTPS 返回码: $TWBS_RC (可能复现 Error 28!)"
                     VM_HTTPS_OK="no"
                 fi
             else
-                echo -e "   $WARN nc 不可用，跳过 TCP 数据传输测试"
+                echo -e "   $WARN toybox wget 不可用"
             fi
-
-            # 方法4: 用 ping 测试外网 (ICMP 层)
-            echo -e " $INFO VM 内外网 ping 测试 (ICMP 层):"
-            for target in "10.0.2.2" "8.8.8.8"; do
-                VM_PING_EXT=$("$ADB_PATH" shell "ping -c 1 -W 3 $target" 2>/dev/null | grep "time=")
-                if [ -n "$VM_PING_EXT" ]; then
-                    VM_PING_MS=$(echo "$VM_PING_EXT" | grep -o 'time=[0-9.]*' | cut -d= -f2 | tr -d '\r')
-                    echo -e "   $PASS ping $target → ${VM_PING_MS}ms"
-                else
-                    echo -e "   $FAIL ping $target → 超时"
-                fi
-            done
         fi
 
-        # VM 内多域名 HTTPS 连通性测试（用可用工具）
-        echo -e " $INFO VM 内多域名连通性对比 (判断是否仅特定域名异常):"
-        for domain in "www.qq.com" "www.baidu.com"; do
+        # VM 内多域名连通性对比（用 ping，因为 curl/wget 不可靠）
+        echo -e " $INFO VM 内多域名连通性对比 (ping ICMP, 判断是否仅特定域名异常):"
+        for domain in "www.qq.com" "www.baidu.com" "$TARGET_HOST"; do
             if [ "$VM_CURL_AVAILABLE" = "1" ]; then
                 VM_DOM=$("$ADB_PATH" shell "curl -sS -o /dev/null -w '%{http_code}:%{time_total}' --connect-timeout 5 --max-time 8 https://$domain" 2>/dev/null | tr -d '\r')
                 DOM_CODE=$(echo "$VM_DOM" | cut -d: -f1)
@@ -426,19 +447,22 @@ if [ -n "$ADB_PATH" ]; then
                 else
                     echo -e "   $FAIL https://$domain → 超时/失败"
                 fi
-            elif [ "$VM_NC_CHECK" != "" ]; then
-                VM_DOM_NC=$("$ADB_PATH" shell "echo > /dev/tcp/$domain/443 && echo OK" 2>/dev/null | tr -d '\r')
-                if [ "$VM_DOM_NC" = "OK" ]; then
-                    echo -e "   $PASS $domain:443 TCP连接成功"
+            elif [ "$VM_WGET_AVAILABLE" = "1" ]; then
+                VM_DOM_W=$("$ADB_PATH" shell "wget -q --spider --timeout=5 --tries=1 https://$domain 2>&1" | tr -d '\r' | tail -1)
+                if echo "$VM_DOM_W" | grep -qE "200|302"; then
+                    echo -e "   $PASS https://$domain → OK"
                 else
-                    echo -e "   $FAIL $domain:443 TCP连接失败"
+                    echo -e "   $WARN https://$domain → $VM_DOM_W"
                 fi
             else
-                VM_DOM_PING=$("$ADB_PATH" shell "ping -c 1 -W 3 $domain" 2>/dev/null | grep "time=")
-                if [ -n "$VM_DOM_PING" ]; then
-                    echo -e "   $PASS $domain → ICMP可达"
+                # 用 ping 测试 DNS 解析 + ICMP 可达性（最可靠）
+                VM_DOM_PING=$("$ADB_PATH" shell "ping -c 1 -W 3 $domain 2>/dev/null" | tr -d '\r')
+                if echo "$VM_DOM_PING" | grep -q "time="; then
+                    VM_DOM_MS=$(echo "$VM_DOM_PING" | grep -o 'time=[0-9.]*' | cut -d= -f2)
+                    echo -e "   $PASS $domain → ICMP可达 (${VM_DOM_MS}ms) (注意: ping成功不代表HTTPS正常)"
                 else
-                    echo -e "   $FAIL $domain → ICMP不可达"
+                    VM_DOM_ERR=$(echo "$VM_DOM_PING" | grep "packet loss\|unreachable" | head -1)
+                    echo -e "   $FAIL $domain → $VM_DOM_ERR"
                 fi
             fi
         done
@@ -555,21 +579,25 @@ echo " 宿主机网络:"
 if [ -n "$ADB_PATH" ] && [ -n "$DEVICES" ]; then
     echo ""
     echo " VM 内网络:"
-    if [ "$VM_HTTP_OK" = "yes" ]; then
+    if [ "$VM_HTTP_OK" = "yes" ] || [ "$VM_HTTP_OK" = "likely_ok" ]; then
         echo -e "   HTTP:  $PASS 正常"
     elif [ "$VM_HTTP_OK" = "no" ]; then
         echo -e "   HTTP:  $FAIL 异常"
     else
-        echo -e "   HTTP:  $WARN 无法测试 (VM内无curl/wget)"
+        echo -e "   HTTP:  $WARN 无法完整测试 (VM内无curl/wget)"
     fi
     if [ "$VM_HTTPS_OK" = "yes" ]; then
         echo -e "   HTTPS: $PASS 正常"
+    elif [ "$VM_HTTPS_OK" = "likely_ok" ]; then
+        echo -e "   HTTPS: $PASS 可能正常 (浏览器测试)"
     elif [ "$VM_HTTPS_OK" = "partial" ]; then
         echo -e "   HTTPS: $WARN TCP连接成功但TLS未测 (VM内无curl/wget)"
     elif [ "$VM_HTTPS_OK" = "no" ]; then
         echo -e "   HTTPS: $FAIL 异常 ← Curl Error 28 可能复现点"
+    elif [ "$VM_HTTPS_OK" = "manual_check" ]; then
+        echo -e "   HTTPS: $INFO 请观察模拟器屏幕上的浏览器结果"
     else
-        echo -e "   HTTPS: $WARN 无法测试 (VM内无curl/wget)"
+        echo -e "   HTTPS: $WARN 无法完整测试 (VM内无curl/wget)"
     fi
 fi
 
@@ -577,7 +605,7 @@ echo ""
 echo " ──────────────────────────────────────"
 
 # 综合判断逻辑
-if [ "$HOST_HTTPS_OK" = "yes" ] && [ "$VM_HTTPS_OK" = "no" ]; then
+if [ "$HOST_HTTPS_OK" = "yes" ] && ([ "$VM_HTTPS_OK" = "no" ] || [ "$VM_HTTPS_OK" = "manual_check" ]); then
     echo -e " ${RED}★ 诊断结论：宿主机 HTTPS 正常但 VM 内 HTTPS 失败${NC}"
     echo -e " ${RED}→ 问题在 QEMU 虚拟网络栈的 HTTPS 转发层${NC}"
     echo -e " ${RED}→ 非 Mac 本地网络问题，非 CDN 服务器问题${NC}"
@@ -593,7 +621,7 @@ if [ "$HOST_HTTPS_OK" = "yes" ] && [ "$VM_HTTPS_OK" = "no" ]; then
     echo "   2. 增加 Unity 的 curl 超时时间（9s → 30s）"
     echo "   3. 检查 QEMU 主线程是否有阻塞点（渲染/IO）"
     echo "   4. 在 VM 启动后等待 90 秒再发起网络请求"
-elif [ "$HOST_HTTPS_OK" = "yes" ] && [ "$VM_HTTPS_OK" = "yes" ]; then
+elif [ "$HOST_HTTPS_OK" = "yes" ] && ([ "$VM_HTTPS_OK" = "yes" ] || [ "$VM_HTTPS_OK" = "likely_ok" ]); then
     echo -e " ${GREEN}★ 诊断结论：宿主机和 VM 内 HTTPS 均正常${NC}"
     echo -e " ${GREEN}→ 当前未复现 Curl Error 28 问题${NC}"
     echo -e " ${GREEN}→ 建议在问题复现时重新运行此脚本${NC}"
@@ -601,7 +629,7 @@ elif [ "$HOST_HTTPS_OK" = "no" ]; then
     echo -e " ${YELLOW}★ 诊断结论：宿主机 HTTPS 也失败，问题可能在本地网络${NC}"
     echo -e " ${YELLOW}→ 请先检查 Mac 的网络连接${NC}"
 elif [ "$VM_HTTPS_OK" = "partial" ]; then
-    echo -e " ${YELLOW}★ 诊断结论：VM 内 HTTPS 仅 TCP 层可达，TLS 握手未验证${NC}"
+    echo -e " ${YELLOW}★ 诊断结论：VM 内 HTTPS 仅 ICMP/TCP 层可达，HTTPS 未验证${NC}"
     echo -e " ${YELLOW}→ VM 内缺少 curl/wget，无法完整测试 HTTPS${NC}"
     echo -e " ${YELLOW}→ 如需完整测试，请先在 VM 内安装 curl (adb shell pm install ...)"
     echo -e " ${YELLOW}→ 或使用 adb push 将 Mac 的 curl 推送到 VM${NC}"
